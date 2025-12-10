@@ -1,0 +1,151 @@
+---
+- name: Monitor AVVA pod logs & restart if required
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    namespace: default
+    pod_label: "app=avva-app"            # label selector to find pod(s)
+    max_restarts: 3                      # restart attempts
+    wait_ready_timeout: 120              # seconds to wait for pod ready after restart
+    log_tail_lines: 200                  # how many lines to check from logs
+    failure_regex: "(?i)(error|failed|exception|panic|traceback)"  # case-insensitive
+    ticket_on_failure: true
+    ticket_api_url: "https://your-servicenow.example/api/now/table/incident"  # replace
+    ticket_auth_user: "svc_awx"          # replace
+    ticket_auth_pass: "REPLACE_ME"       # use AWX credential instead of storing here
+    ticket_payload:
+      short_description: "AVVA pod failed after restarts"
+      description: |
+        Pod label: {{ pod_label }}
+        Namespace: {{ namespace }}
+        Attempts: {{ max_restarts }}
+        Observed logs: "{{ last_failure_excerpt | default('n/a') }}"
+
+  vars_prompt: []   # no prompts
+
+  tasks:
+
+    - name: Find pod name(s) matching label
+      command: >-
+        kubectl get pods -n {{ namespace }} -l "{{ pod_label }}" -o jsonpath='{.items[0].metadata.name}'
+      register: pod_get
+      failed_when: pod_get.rc != 0 and pod_get.stdout == ""
+      changed_when: false
+
+    - name: set pod_name fact
+      set_fact:
+        pod_name: "{{ pod_get.stdout | trim }}"
+      when: pod_get.stdout != ""
+
+    - name: Fail if no pod found
+      fail:
+        msg: "No pod found matching label {{ pod_label }} in namespace {{ namespace }}"
+      when: pod_name is not defined or pod_name == ""
+
+    - name: Fetch latest logs
+      command: >-
+        kubectl logs {{ pod_name }} -n {{ namespace }} --tail={{ log_tail_lines }}
+      register: pod_logs
+      failed_when: false
+      changed_when: false
+
+    - name: Search logs for failure pattern
+      set_fact:
+        failed_match: "{{ (pod_logs.stdout is search(failure_regex)) | bool }}"
+        last_failure_excerpt: "{{ pod_logs.stdout | regex_search(failure_regex + '.*', multiline=True) | default(pod_logs.stdout[:400]) }}"
+      # no failure condition here; we only mark
+
+    - name: "Debug: pod logs indicate failure?"
+      debug:
+        msg: "failed_match={{ failed_match }}"
+
+    - name: If no failure found — exit clean
+      meta: end_play
+      when: failed_match == false
+
+    # If failure found, attempt restarts up to max_restarts
+    - name: Try restart cycle (loop)
+      block:
+        - name: Attempt restart {{ item }} — trigger a pod restart
+          vars:
+            attempt_idx: "{{ item }}"
+          block:
+            - name: Restart by deleting pod (deployment will recreate)
+              command: kubectl delete pod {{ pod_name }} -n {{ namespace }} --wait=false
+              register: del_res
+              failed_when: false
+
+            - name: Wait for new pod to appear and become ready (by label)
+              command: >
+                bash -lc "kubectl wait --for=condition=ready pod -l '{{ pod_label }}' -n {{ namespace }} --timeout={{ wait_ready_timeout }}s"
+              register: wait_res
+              failed_when: wait_res.rc != 0
+
+            - name: Refresh pod name after restart
+              command: >-
+                kubectl get pods -n {{ namespace }} -l "{{ pod_label }}" -o jsonpath='{.items[0].metadata.name}'
+              register: pod_get_after
+              failed_when: pod_get_after.rc != 0
+              changed_when: false
+
+            - name: set new pod_name fact
+              set_fact:
+                pod_name: "{{ pod_get_after.stdout | trim }}"
+
+            - name: Sleep 5s to let logs stabilize
+              pause:
+                seconds: 5
+
+            - name: Get logs after restart
+              command: kubectl logs {{ pod_name }} -n {{ namespace }} --tail={{ log_tail_lines }}
+              register: pod_logs_after
+              failed_when: false
+
+            - name: Check if failure still present after restart
+              set_fact:
+                failed_match_after: "{{ (pod_logs_after.stdout is search(failure_regex)) | bool }}"
+                last_failure_excerpt: "{{ pod_logs_after.stdout | regex_search(failure_regex + '.*', multiline=True) | default(pod_logs_after.stdout[:400]) }}"
+
+            - name: Stop loop early if pod is healthy
+              meta: end_loop
+          rescue:
+            - name: Record that this restart attempt failed (couldn't bring pod ready)
+              set_fact:
+                failed_match_after: true
+              # continue to next attempt
+      loop: "{{ range(1, (max_restarts | int) + 1) | list }}"
+      when: failed_match
+      register: restart_loop_result
+
+    - name: After restart attempts — determine final state
+      set_fact:
+        final_failed: "{{ (restart_loop_result is defined and (restart_loop_result.results | selectattr('ansible_facts.failed_match_after','defined') | list | last).ansible_facts.failed_match_after) | default(true) }}"
+
+    - name: If still failing and ticket_on_failure -> create a ticket
+      when: final_failed and ticket_on_failure
+      block:
+        - name: Create ticket in ServiceNow (example)
+          uri:
+            url: "{{ ticket_api_url }}"
+            method: POST
+            user: "{{ ticket_auth_user }}"
+            password: "{{ ticket_auth_pass }}"
+            force_basic_auth: yes
+            status_code: 201,200
+            headers:
+              Content-Type: "application/json"
+            body: "{{ ticket_payload | to_json }}"
+          register: ticket_res
+          failed_when: ticket_res.status not in [200,201]
+        - name: debug ticket response
+          debug:
+            var: ticket_res.json
+      # if you use Jira, replace with jira module or uri to Jira API
+
+    - name: Final status message
+      debug:
+        msg: >-
+          Play complete. Pod label "{{ pod_label }}" final_failed={{ final_failed }}.
+          Last failure excerpt: {{ last_failure_excerpt | default('n/a') }}

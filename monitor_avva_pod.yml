@@ -12,9 +12,9 @@
     log_tail_lines: 200                  # how many lines to check from logs
     failure_regex: "(?i)(error|failed|exception|panic|traceback)"  # case-insensitive
     ticket_on_failure: true
-    ticket_api_url: "https://your-servicenow.example/api/now/table/incident"  # replace
-    ticket_auth_user: "svc_awx"          # replace
-    ticket_auth_pass: "REPLACE_ME"       # use AWX credential instead of storing here
+    ticket_api_url: "https://ascendiondigitalsolutionsdemo1.service-now.com/api/now/table/incident"  # replace
+    ticket_auth_user: "Thejas"          # replace
+    ticket_auth_pass: "User@2003"       # use AWX credential instead of storing here
     ticket_payload:
       short_description: "AVVA pod failed after restarts"
       description: |

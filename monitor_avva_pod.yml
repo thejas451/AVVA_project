@@ -10,12 +10,13 @@
     max_restarts: 3
     wait_ready_timeout: 120
     log_tail_lines: 200
-    failure_regex: "(?i)(error|failed|exception|panic|traceback)"
+    # grep-friendly regex (no (?i) here; grep -i used below)
+    failure_grep: "error|failed|exception|panic|traceback"
 
     ticket_on_failure: true
     ticket_api_url: "https://ascendiondigitalsolutionsdemo1.service-now.com/api/now/table/incident"
 
-    # These come from AWX credential mapping
+    # AWX credential mapped variables (set these in the Job Template -> Credentials -> Survey or extra_vars)
     ticket_auth_user: "{{ sn_user }}"
     ticket_auth_pass: "{{ sn_pass }}"
 
@@ -35,70 +36,65 @@
         -o jsonpath='{.items[0].metadata.name}'
       register: pod_get
       failed_when: pod_get.stdout == ""
+      changed_when: false
 
     - set_fact:
         pod_name: "{{ pod_get.stdout | trim }}"
 
-    - name: Fetch latest logs
+    - name: Fetch latest logs (initial check)
       command: kubectl logs {{ pod_name }} -n {{ namespace }} --tail={{ log_tail_lines }}
       register: pod_logs
       failed_when: false
+      changed_when: false
 
     - set_fact:
-        failed_match: "{{ (pod_logs.stdout is search(failure_regex)) | bool }}"
+        failed_match: "{{ (pod_logs.stdout is search('(?i)(' + failure_grep + ')')) | bool }}"
         last_failure_excerpt: "{{ pod_logs.stdout[:400] }}"
 
-    - name: Exit play if pod is healthy
+    - name: Exit if pod healthy
       meta: end_play
       when: failed_match == false
 
-    ###############################################################
-    # Restart loop — FIXED for AWX using with_sequence
-    ###############################################################
-    - name: Restart pod attempts
+    ################################################################
+    # Single task that does: delete pod -> wait for ready -> check logs
+    # This task will be retried up to max_restarts attempts (retries/until)
+    ################################################################
+    - name: Restart pod and verify health (retries up to max_restarts)
+      shell: |
+        set -o pipefail
+        # delete old pod (ignore error if not found)
+        kubectl delete pod {{ pod_name }} -n {{ namespace }} --wait=false || true
+
+        # wait for a new ready pod to appear (timeout defined)
+        kubectl wait --for=condition=ready pod -l "{{ pod_label }}" -n {{ namespace }} --timeout={{ wait_ready_timeout }}s
+
+        # get current pod name
+        newpod=$(kubectl get pods -n {{ namespace }} -l "{{ pod_label }}" -o jsonpath='{.items[0].metadata.name}')
+
+        # fetch logs and check for failure strings (grep -i)
+        # if grep finds a match -> exit 1 (meaning unhealthy), otherwise exit 0
+        kubectl logs -n {{ namespace }} "${newpod}" --tail={{ log_tail_lines }} | grep -Ei "{{ failure_grep }}" && exit 1 || exit 0
+      register: restart_check
+      failed_when: false
+      retries: "{{ max_restarts }}"
+      delay: 5
+      until: restart_check.rc == 0
+
+    - name: Set final state facts
+      set_fact:
+        final_failed: "{{ restart_check is defined and restart_check.rc != 0 }}"
+
+    - name: Capture last logs for ticket (if final_failed)
+      when: final_failed
       block:
-
-        - name: Delete pod to restart it
-          command: kubectl delete pod {{ pod_name }} -n {{ namespace }} --wait=false
-          failed_when: false
-
-        - name: Wait for new pod to be ready
-          command: >
-            kubectl wait --for=condition=ready pod -l "{{ pod_label }}"
-            -n {{ namespace }} --timeout={{ wait_ready_timeout }}s
-          register: wait_res
-          failed_when: wait_res.rc != 0
-
-        - name: Get new pod name
-          command: >
-            kubectl get pods -n {{ namespace }} -l "{{ pod_label }}"
-            -o jsonpath='{.items[0].metadata.name}'
-          register: newpod
-
+        - name: Get current pod name (final)
+          command: kubectl get pods -n {{ namespace }} -l "{{ pod_label }}" -o jsonpath='{.items[0].metadata.name}'
+          register: pod_current
+        - name: Get last logs excerpt
+          command: kubectl logs -n {{ namespace }} {{ pod_current.stdout | trim }} --tail={{ log_tail_lines }}
+          register: final_logs
         - set_fact:
-            pod_name: "{{ newpod.stdout | trim }}"
-
-        - pause:
-            seconds: 5
-
-        - name: Check logs after restart
-          command: kubectl logs {{ pod_name }} -n {{ namespace }} --tail={{ log_tail_lines }}
-          register: log_after
-
-        - set_fact:
-            failed_match_after: "{{ (log_after.stdout is search(failure_regex)) | bool }}"
-            last_failure_excerpt: "{{ log_after.stdout[:400] }}"
-
-        - meta: end_loop
-          when: failed_match_after == false
-
-      with_sequence: start=1 end="{{ max_restarts }}"
-
-    ###############################################################
-    # Final result and ticket creation
-    ###############################################################
-    - set_fact:
-        final_failed: "{{ failed_match_after | default(true) }}"
+            last_failure_excerpt: "{{ final_logs.stdout[:800] }}"
 
     - name: Create ServiceNow ticket if failure continues
       when: final_failed and ticket_on_failure
@@ -115,8 +111,8 @@
       register: ticket_result
 
     - debug:
-        var: ticket_result.json
-      when: final_failed and ticket_on_failure
+        msg: "Monitoring finished. final_failed={{ final_failed }}. pod={{ pod_name }}"
 
     - debug:
-        msg: "Monitoring finished. Final failure = {{ final_failed }} | pod = {{ pod_name }}"
+        var: ticket_result.json
+      when: final_failed and ticket_on_failure

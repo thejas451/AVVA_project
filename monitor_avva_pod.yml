@@ -32,6 +32,37 @@
         Observed logs: "{{ last_failure_excerpt | default('n/a') }}"
 
   tasks:
+        #################################################################
+    # Step 0 — Check if az & kubectl are available in the AWX runner
+    #################################################################
+    - name: Check az is available
+      ansible.builtin.shell: "which az || true"
+      register: az_path
+      changed_when: false
+
+    - name: Debug az path
+      ansible.builtin.debug:
+        var: az_path.stdout
+
+    - name: Fail if az is missing
+      ansible.builtin.fail:
+        msg: "Azure CLI (az) NOT FOUND. Use an Execution Environment that includes azure-cli."
+      when: az_path.stdout == ""
+
+    - name: Check kubectl is available
+      ansible.builtin.shell: "which kubectl || true"
+      register: kubectl_path
+      changed_when: false
+
+    - name: Debug kubectl path
+      ansible.builtin.debug:
+        var: kubectl_path.stdout
+
+    - name: Fail if kubectl is missing
+      ansible.builtin.fail:
+        msg: "kubectl NOT FOUND. Use an Execution Environment that includes kubectl."
+      when: kubectl_path.stdout == ""
+      
     - name: Ensure az is available (debug)
       ansible.builtin.shell: |
         bash -lc "az --version || true"

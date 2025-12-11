@@ -1,17 +1,14 @@
----
-- name: Test Azure environment variables from AWX credential
+- name: Show whether Azure env vars are present (no secret values printed)
   hosts: localhost
   gather_facts: no
-
   tasks:
-    - name: Show whether Azure env vars are present (no secret values printed)
+    - name: Show presence
       ansible.builtin.shell: |
-        bash -lc 'for v in AZURE_CLIENT_ID AZURE_SECRET AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+        bash -lc 'for v in AZURE_CLIENT_ID AZURE_SECRET AZURE_TENANT AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
           if [ -n "${!v:-}" ]; then echo "$v=SET"; else echo "$v=NOT_SET"; fi
         done'
       register: azure_env_check
       changed_when: false
 
-    - name: Debug azure-env presence
-      ansible.builtin.debug:
+    - debug:
         var: azure_env_check.stdout_lines

@@ -1,9 +1,11 @@
 ---
 - name: Monitor AVVA pod logs, restart on failure, create ServiceNow ticket if needed
-  hosts: 10.112.0.11         # AWX job runner host where az & kubectl are available
+  hosts: localhost
+  connection: local
   gather_facts: no
+
   vars:
-    # Kubernetes / pod settings
+    # k8s / pod settings
     k8s_namespace: default
     pod_label: "app=avva-app"
     max_restarts: 3
@@ -11,17 +13,16 @@
     log_tail_lines: 200
     log_since: "5m"
 
-    # Failure detection (we use egrep -Ei inside the shell)
+    # failure detection (egrep -Ei)
     failure_regex: "error|failed|exception|panic|traceback"
 
-    # Ticketing
+    # ticketing
     ticket_on_failure: true
     ticket_api_url: "https://ascendiondigitalsolutionsdemo1.service-now.com/api/now/table/incident"
 
-    # NOTE: sn_user/sn_pass must be provided by AWX (credential or extra_vars)
-    # Example: set them as credential variables mapped to the job template
-    ticket_user: "{{ sn_user }}"
-    ticket_pass: "{{ sn_pass }}"
+    # ServiceNow credentials: provide these as Job Template extra vars or via AWX credential mapping
+    # sn_user: "svc_awx"        <-- supply in Job Template extra vars or credential
+    # sn_pass: "REDACTED"       <-- supply in Job Template extra vars or credential
 
     ticket_payload:
       short_description: "AVVA pod failed after restarts"
@@ -32,67 +33,46 @@
         Observed logs: "{{ last_failure_excerpt | default('n/a') }}"
 
   tasks:
-        #################################################################
-    # Step 0 — Check if az & kubectl are available in the AWX runner
-    #################################################################
-    - name: Check az is available
-      ansible.builtin.shell: "which az || true"
-      register: az_path
-      changed_when: false
-
-    - name: Debug az path
-      ansible.builtin.debug:
-        var: az_path.stdout
-
-    - name: Fail if az is missing
-      ansible.builtin.fail:
-        msg: "Azure CLI (az) NOT FOUND. Use an Execution Environment that includes azure-cli."
-      when: az_path.stdout == ""
-
-    - name: Check kubectl is available
-      ansible.builtin.shell: "which kubectl || true"
-      register: kubectl_path
-      changed_when: false
-
-    - name: Debug kubectl path
-      ansible.builtin.debug:
-        var: kubectl_path.stdout
-
-    - name: Fail if kubectl is missing
-      ansible.builtin.fail:
-        msg: "kubectl NOT FOUND. Use an Execution Environment that includes kubectl."
-      when: kubectl_path.stdout == ""
-      
-    - name: Ensure az is available (debug)
+    - name: Show which Azure env vars are present (non-sensitive)
       ansible.builtin.shell: |
-        bash -lc "az --version || true"
-      register: az_version
+        bash -lc 'for v in AZURE_CLIENT_ID AZURE_SECRET AZURE_TENANT AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+          if [ -n "${!v:-}" ]; then echo "$v=SET"; else echo "$v=NOT_SET"; fi
+        done'
+      register: azure_env_check
       changed_when: false
 
-    - name: Azure login using AWX-provided SP environment variables
-      # AWX Azure Resource credential injects these ENV vars:
-      # AZURE_CLIENT_ID, AZURE_SECRET, AZURE_TENANT_ID  (or similar, depending on AWX version)
+    - name: Debug azure env presence
+      ansible.builtin.debug:
+        var: azure_env_check.stdout_lines
+
+    - name: Fail if AZURE_CLIENT_ID or AZURE_SECRET or AZURE_TENANT not set
+      ansible.builtin.fail:
+        msg: "Required Azure env vars missing. Attach Azure RM credential to job template."
+      when: >
+        (lookup('env','AZURE_CLIENT_ID') | default('')) == "" or
+        (lookup('env','AZURE_SECRET')   | default('')) == "" or
+        (lookup('env','AZURE_TENANT')   | default('')) == ""
+
+    - name: Login to Azure using AWX-injected env vars
       ansible.builtin.shell: |
-        bash -lc "set -o pipefail
-        if [ -z \"$AZURE_CLIENT_ID\" ] || [ -z \"$AZURE_SECRET\" ] || [ -z \"$AZURE_TENANT_ID\" ]; then
-          echo 'MISSING_AZURE_ENV_VARS' >&2
-          exit 2
-        fi
-        az login --service-principal --username \"$AZURE_CLIENT_ID\" --password \"$AZURE_SECRET\" --tenant \"$AZURE_TENANT_ID\" >/dev/null"
+        bash -lc "az login --service-principal \
+          --username \"$AZURE_CLIENT_ID\" \
+          --password \"$AZURE_SECRET\" \
+          --tenant \"$AZURE_TENANT\" >/dev/null"
       register: az_login
       failed_when: az_login.rc != 0
       changed_when: false
 
     - name: Get AKS credentials (merge into kubeconfig)
       ansible.builtin.shell: >
-        bash -lc "az aks get-credentials --resource-group {{ lookup('env','AZURE_RESOURCE_GROUP') | default('') | default('') }} --name {{ lookup('env','AZURE_AKS_NAME') | default('') | default('') }} --overwrite-existing || az aks get-credentials --resource-group {{ 'Azure_REG' }} --name {{ 'AVVA_aks' }} --overwrite-existing"
+        bash -lc "az aks get-credentials --resource-group Azure_REG --name AVVA_aks --overwrite-existing"
       register: aks_creds
       failed_when: aks_creds.rc != 0
       changed_when: true
 
-    - name: Find pod name matching label (first item)
+    - name: Find pod name matching label
       ansible.builtin.shell: >
-        bash -lc "kubectl get pods -n {{ k8s_namespace }} -l '{{ pod_label }}' -o 'jsonpath={.items[0].metadata.name}'"
+        bash -lc "kubectl get pods -n {{ k8s_namespace }} -l '{{ pod_label }}' -o jsonpath='{.items[0].metadata.name}'"
       register: pod_get
       changed_when: false
       failed_when: pod_get.stdout | trim == ""
@@ -108,7 +88,7 @@
       changed_when: false
       failed_when: false
 
-    - name: Check logs for failure regex (Ansible side)
+    - name: Evaluate logs for failure pattern
       ansible.builtin.set_fact:
         failed_match: "{{ (pod_logs.stdout is search(failure_regex, ignorecase=True)) | bool }}"
         last_failure_excerpt: "{{ pod_logs.stdout[:400] }}"
@@ -117,52 +97,24 @@
       meta: end_play
       when: not failed_match
 
-    #################################################################
-    # Restart attempts loop implemented inside a single shell block
-    # (cleaner in YAML and compatible with AWX)
-    #################################################################
     - name: Restart pod up to max_restarts and check logs after each attempt
       ansible.builtin.shell: |
         set -euo pipefail
-        NS="{{ k8s_namespace }}"
-        LABEL='{{ pod_label }}'
-        MAX={{ max_restarts }}
-        LOG_LINES={{ log_tail_lines }}
-        FAIL_PAT="{{ failure_regex }}"
-
-        attempt=1
-        last_logs=""
-
+        NS="{{ k8s_namespace }}"; LABEL='{{ pod_label }}'; MAX={{ max_restarts }}; LOG_LINES={{ log_tail_lines }}; FAIL_PAT="{{ failure_regex }}"
+        attempt=1; last_logs=""
         while [ "$attempt" -le "$MAX" ]; do
           echo "ATTEMPT=$attempt"
           POD=$(kubectl get pods -n "$NS" -l "$LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          if [ -n "$POD" ]; then
-            echo "Deleting pod $POD"
-            kubectl delete pod "$POD" -n "$NS" --wait=false || true
-          else
-            echo "No pod found to delete"
-          fi
-
-          echo "Waiting for pod ready by label..."
+          if [ -n "$POD" ]; then kubectl delete pod "$POD" -n "$NS" --wait=false || true; fi
           kubectl wait --for=condition=ready pod -l "$LABEL" -n "$NS" --timeout={{ wait_ready_timeout }}s || true
-
           NEWPOD=$(kubectl get pods -n "$NS" -l "$LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          echo "New pod: $NEWPOD"
           sleep 5
-
           last_logs=$(kubectl logs "$NEWPOD" -n "$NS" --tail="$LOG_LINES" 2>/dev/null || true)
-          echo "$last_logs"  # include logs in stdout for Ansible to capture
-
+          echo "$last_logs"
           echo "$last_logs" | egrep -Ei "$FAIL_PAT" >/dev/null 2>&1
-          if [ $? -ne 0 ]; then
-            echo "POD_HEALTHY_AFTER_RESTART"
-            exit 0
-          fi
-
+          if [ $? -ne 0 ]; then echo "POD_HEALTHY_AFTER_RESTART"; exit 0; fi
           attempt=$((attempt+1))
         done
-
-        # if we reach here, pod still failing after attempts
         echo "POD_STILL_FAILING_AFTER_RESTARTS"
         echo "$last_logs"
         exit 1
@@ -170,21 +122,18 @@
       changed_when: false
       failed_when: false
 
-    - name: Determine final_failed and save last_failure_excerpt
+    - name: Determine final_failed and last excerpt
       ansible.builtin.set_fact:
         final_failed: "{{ 'POD_STILL_FAILING_AFTER_RESTARTS' in (restart_result.stdout | default('')) }}"
         last_failure_excerpt: "{{ (restart_result.stdout | default(''))[:400] }}"
 
-    #################################################################
-    # Create ServiceNow ticket if still failing
-    #################################################################
-    - name: Create ServiceNow ticket if failure continues
+    - name: Create ServiceNow ticket if still failing
       when: final_failed and ticket_on_failure
       ansible.builtin.uri:
         url: "{{ ticket_api_url }}"
         method: POST
-        user: "{{ ticket_user }}"
-        password: "{{ ticket_pass }}"
+        user: "{{ sn_user }}"
+        password: "{{ sn_pass }}"
         force_basic_auth: yes
         status_code: [200,201]
         headers:
@@ -194,14 +143,11 @@
       register: ticket_result
       failed_when: ticket_result.status not in [200,201]
 
-    - name: Show ServiceNow response (if created)
+    - name: Show ServiceNow response
       ansible.builtin.debug:
         var: ticket_result.json
       when: final_failed and ticket_on_failure
 
-    - name: Final status
+    - name: Final message
       ansible.builtin.debug:
-        msg: >
-          Monitoring finished. final_failed={{ final_failed }},
-          pod={{ pod_name }},
-          last_failure_excerpt="{{ last_failure_excerpt | default('n/a') }}"
+        msg: "Done: final_failed={{ final_failed }} pod={{ pod_name }} excerpt='{{ last_failure_excerpt }}'"
